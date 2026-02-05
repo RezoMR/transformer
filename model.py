@@ -88,12 +88,13 @@ class QuantileTransformerConfig:
     horizon: int = 96
     quantiles: Sequence[float] = tuple([0.1 * i for i in range(1, 10)])  # 0.1..0.9
 
-    # Feature dimensions (MUSIA sedieť s tvojimi DataLoadermi)
-    d_enc_in: int = 16
-    d_dec_in: int = 8  # can be 0
+
+    # vytvoriť z build cfg nie iba cez konštruktor
+    d_enc_in: int = 0
+    d_dec_in: int = 0  # can be 0
 
     # Transformer sizes
-    d_model: int = 128
+    d_model: int = 512
     nhead: int = 8
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4

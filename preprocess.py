@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Dict
 
@@ -6,7 +7,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from functools import reduce
 
 
 # -----------------------------
@@ -304,3 +304,28 @@ def prepare_for_quantile_transformer(
         feature_cols={"enc": encoder_feature_cols, "dec": decoder_feature_cols, "target": [target_col]},
         arrays=arrays,
     )
+
+
+def cut_last_full_days(df: pd.DataFrame, period_col="period_end", days=2, steps_per_day=96) -> pd.DataFrame:
+    work = df.copy()
+    if period_col in work.columns:
+        work[period_col] = pd.to_datetime(work[period_col])
+        work = work.sort_values(period_col)
+    else:
+        raise ValueError(f"Missing '{period_col}' column.")
+
+    n_cut = days * steps_per_day
+    if len(work) <= n_cut:
+        raise ValueError("Not enough rows to cut last days.")
+
+    return work.iloc[:-n_cut].reset_index(drop=True)
+
+
+df = pd.read_csv("raw_data/raw_data_merged.csv")
+df_cut = cut_last_full_days(df)
+prepared = prepare_for_quantile_transformer(
+    df=df_cut,
+    target_col="zuctovacia cena za odchylku",
+    L=96*7,     # napr. 7 dní histórie (7*96 = 672)
+    H=96,       # 1 deň dopredu
+)
