@@ -14,15 +14,19 @@ import torch.nn as nn
 # Utilities
 # -----------------------------
 def make_causal_mask(T: int, device: torch.device) -> torch.Tensor:
-    """Causal mask for decoder self-attention (True = masked). Shape (T, T)."""
+    """Causal mask for decoder self-attention (True = masked). Shape (T, T).
+    T dĺžka cielovej sekvencie v dekóderi
+
+    """
     return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
 
 
+
 def pinball_loss(
-    y: torch.Tensor,
-    yhat_q: torch.Tensor,
-    quantiles: torch.Tensor,
-    reduction: str = "mean",
+    y: torch.Tensor,    # ground truth
+    yhat_q: torch.Tensor,   #kvantilové predikcie
+    quantiles: torch.Tensor,    #vektor kvantilov
+    reduction: str = "mean",    # mean/sum/none
 ) -> torch.Tensor:
     """
     Pinball (quantile) loss.
@@ -30,6 +34,9 @@ def pinball_loss(
     y:      (B, H) or (B, H, 1)
     yhat_q: (B, H, Q)
     quantiles: (Q,) in (0,1)
+
+    penalizuje podľa kvantilu ak je q=0.9 a je to pod predikciou trestá viac
+    ak je q=0.1 a je to nad predikciou trestá viac
     """
     if y.dim() == 2:
         y = y.unsqueeze(-1)  # (B,H,1)
@@ -40,6 +47,8 @@ def pinball_loss(
 
     q = quantiles.view(1, 1, -1).to(yhat_q.device)  # (1,1,Q)
     err = y - yhat_q                                 # (B,H,Q)
+                                                    #ak je predikcia pod skutočnosťou (yhat_q nízke), err > 0
+                                                    #ak je predikcia nad skutočnosťou, err < 0
     loss = torch.maximum(q * err, (1.0 - q) * (-err))
 
     if reduction == "mean":
@@ -50,12 +59,13 @@ def pinball_loss(
         return loss
     raise ValueError("reduction must be one of: 'mean','sum','none'")
 
-
 def quantile_crossing_penalty(yhat_q: torch.Tensor) -> torch.Tensor:
     """
     Penalize quantile crossings: q_{k} should be <= q_{k+1}.
     yhat_q: (B,H,Q)
     Returns scalar penalty (mean of positive crossings).
+    Účel: kvantily musia byť monotónne:
+    q0.1 <= q0.2 <= ... <= q0.9
     """
     # diff along quantile dimension
     diffs = yhat_q[..., 1:] - yhat_q[..., :-1]  # should be >= 0
@@ -63,21 +73,25 @@ def quantile_crossing_penalty(yhat_q: torch.Tensor) -> torch.Tensor:
 
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding for (B, T, D) with batch_first=True."""
+    """Sinusoidal positional encoding for (B, T, D) with batch_first=True.
+    d_model: vnútorný rozmer transformer reprezentácie D
+    max_len: max dĺžka sekvencie
+    """
     def __init__(self, d_model: int, max_len: int = 4096):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
-        )
+        ) #škáluje frekvencie sínusov/kosínusov
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # (1,max_len,D)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # (1,max_len,D) (B,T,D)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.size(1)
         return x + self.pe[:, :T, :]
+        #x: (B,T,D) vráti (B,T,D) s pripočítaným PE
 
 
 # -----------------------------
@@ -85,30 +99,30 @@ class PositionalEncoding(nn.Module):
 # -----------------------------
 @dataclass
 class QuantileTransformerConfig:
-    horizon: int = 96
+    horizon: int = 96         #počet krokov dopredu
     quantiles: Sequence[float] = tuple([0.1 * i for i in range(1, 10)])  # 0.1..0.9
 
 
     # vytvoriť z build cfg nie iba cez konštruktor
-    d_enc_in: int = 0
-    d_dec_in: int = 0  # can be 0
+    d_enc_in: int = 0   #počet encoder vstupných príznakov na časový krok (história)
+    d_dec_in: int = 0  # can be 0 , počet dekóder vstupných príznakov na horizontový krok (budúce známe)
 
     # Transformer sizes
-    d_model: int = 512
-    nhead: int = 8
-    num_encoder_layers: int = 4
-    num_decoder_layers: int = 4
-    dim_feedforward: int = 512
+    d_model: int = 512 #vnútorná dimenzia reprezentácie D
+    nhead: int = 8 #počet attention hláv
+    num_encoder_layers: int = 4 #počet encoder blokov
+    num_decoder_layers: int = 4 #počet decoder blokov
+    dim_feedforward: int = 512 #šírka FFN vo vnútri každého transformer bloku
     dropout: float = 0.1
 
     # Positional encoding
-    max_len: int = 4096
+    max_len: int = 4096     # max dĺžka sekvencií pre PE
 
     # Whether decoder uses known-future covariates (x_future)
-    use_known_future: bool = True
+    use_known_future: bool = True #či sa použáva decoder
 
     # Optional quantile crossing penalty (0 = off)
-    crossing_penalty_weight: float = 0.0
+    crossing_penalty_weight: float = 0.0    #pridá penalizáciu crossingov
 
 
 class QuantileEncoderDecoderTransformer(nn.Module):
@@ -116,7 +130,7 @@ class QuantileEncoderDecoderTransformer(nn.Module):
     Direct multi-horizon quantile forecaster.
 
     Inputs:
-      x_hist   : (B, L, d_enc_in)
+      x_hist   : (B, L, d_enc_in)    #B - batch size, L - dlzka historického okna
       x_future : (B, H, d_dec_in)  [optional]
     Output:
       yhat_q   : (B, H, Q)
@@ -134,8 +148,10 @@ class QuantileEncoderDecoderTransformer(nn.Module):
         self.enc_in_proj = nn.Linear(cfg.d_enc_in, cfg.d_model)
 
         self.horizon_queries = nn.Parameter(torch.randn(1, cfg.horizon, cfg.d_model) * 0.02)
+        #posiela do dekodera naučitelné query tokeny jeden token pre každý horizont
+        #token pre horizont h sa naučí pýtať (attendovať) z encoder memory to, čo potrebuje, aby odhadol y v horizonte h
 
-        if cfg.d_dec_in > 0:
+        if cfg.d_dec_in > 0: #ak sú kovariácie: premietne ich do D a pripočítaš k query tokenom
             self.dec_in_proj = nn.Linear(cfg.d_dec_in, cfg.d_model)
         else:
             self.dec_in_proj = None
@@ -167,6 +183,7 @@ class QuantileEncoderDecoderTransformer(nn.Module):
 
         # Quantile head
         self.out_head = nn.Linear(cfg.d_model, self.Q)
+        #z decoder reprezentácie (B,H,D) spraví kvantily (B,H,Q)
 
     def forward(
         self,
@@ -175,7 +192,7 @@ class QuantileEncoderDecoderTransformer(nn.Module):
         hist_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        x_hist: (B, L, d_enc_in)
+        x_hist: (B, L, d_enc_in)  #d_enc_in počet historických príznakov, L = lookback length
         x_future: (B, H, d_dec_in) or None
         hist_padding_mask: (B, L) bool, True for padded positions (optional)
         """
@@ -278,10 +295,10 @@ def train_one_epoch(
         if x_fut is not None:
             x_fut = x_fut.to(device)
 
-        yhat_q = model(x_hist, x_fut)
-        loss = model.loss(y_true, yhat_q)
+        yhat_q = model(x_hist, x_fut)       #forward
+        loss = model.loss(y_true, yhat_q)       #loss
 
-        loss.backward()
+        loss.backward() #backprop
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 

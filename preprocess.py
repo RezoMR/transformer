@@ -92,6 +92,13 @@ class StandardScalerNP:
             raise ValueError("Scaler not fit yet.")
         return x * self.std_ + self.mean_
 
+def _inverse_scale_y(y_scaled: np.ndarray, y_scaler: Optional[StandardScalerNP]) -> np.ndarray:
+    if y_scaler is None:
+        return y_scaled
+    shp = y_scaled.shape
+    flat = y_scaled.reshape(-1, 1)
+    inv = y_scaler.inverse_transform(flat).reshape(shp)
+    return inv
 
 # -----------------------------
 # Windowing helpers
@@ -306,26 +313,35 @@ def prepare_for_quantile_transformer(
     )
 
 
-def cut_last_full_days(df: pd.DataFrame, period_col="period_end", days=2, steps_per_day=96) -> pd.DataFrame:
+import pandas as pd
+
+def split_last_full_days(
+    df: pd.DataFrame,
+    period_col: str = "period_end",
+    days: int = 7,
+    steps_per_day: int = 96,
+):
     work = df.copy()
-    if period_col in work.columns:
-        work[period_col] = pd.to_datetime(work[period_col])
-        work = work.sort_values(period_col)
-    else:
+    if period_col not in work.columns:
         raise ValueError(f"Missing '{period_col}' column.")
+
+    work[period_col] = pd.to_datetime(work[period_col])
+    work = work.sort_values(period_col).reset_index(drop=True)
 
     n_cut = days * steps_per_day
     if len(work) <= n_cut:
         raise ValueError("Not enough rows to cut last days.")
 
-    return work.iloc[:-n_cut].reset_index(drop=True)
+    df_keep = work.iloc[:-n_cut].reset_index(drop=True)
+    df_last = work.iloc[-n_cut:].reset_index(drop=True)
+    return df_keep, df_last
 
-
-df = pd.read_csv("raw_data/raw_data_merged.csv")
-df_cut = cut_last_full_days(df)
-prepared = prepare_for_quantile_transformer(
-    df=df_cut,
-    target_col="zuctovacia cena za odchylku",
-    L=96*7,     # napr. 7 dní histórie (7*96 = 672)
-    H=96,       # 1 deň dopredu
-)
+#
+# df = pd.read_csv("raw_data/raw_data_merged.csv")
+# df_cut = cut_last_full_days(df)
+# prepared = prepare_for_quantile_transformer(
+#     df=df_cut,
+#     target_col="isp",
+#     L=96*7,     # napr. 7 dní histórie (7*96 = 672)
+#     H=96,       # 1 deň dopredu
+# )
