@@ -16,17 +16,17 @@ import torch.nn as nn
 def make_causal_mask(T: int, device: torch.device) -> torch.Tensor:
     """Causal mask for decoder self-attention (True = masked). Shape (T, T).
     T dĺžka cielovej sekvencie v dekóderi
-
     """
     return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
 
 
 
 def pinball_loss(
-    y: torch.Tensor,    # ground truth
-    yhat_q: torch.Tensor,   #kvantilové predikcie
-    quantiles: torch.Tensor,    #vektor kvantilov
-    reduction: str = "mean",    # mean/sum/none
+    y: torch.Tensor,
+    yhat_q: torch.Tensor,
+    quantiles: torch.Tensor,
+    weights: Optional[torch.Tensor] = None,   # NEW
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Pinball (quantile) loss.
@@ -50,6 +50,9 @@ def pinball_loss(
                                                     #ak je predikcia pod skutočnosťou (yhat_q nízke), err > 0
                                                     #ak je predikcia nad skutočnosťou, err < 0
     loss = torch.maximum(q * err, (1.0 - q) * (-err))
+    if weights is not None:
+        w = weights.view(1, 1, -1).to(yhat_q.device)
+        loss = loss * w
 
     if reduction == "mean":
         return loss.mean()
@@ -88,6 +91,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # (1,max_len,D) (B,T,D)
 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.size(1)
         return x + self.pe[:, :T, :]
@@ -119,7 +123,8 @@ class QuantileTransformerConfig:
     max_len: int = 4096     # max dĺžka sekvencií pre PE
 
     # Whether decoder uses known-future covariates (x_future)
-    use_known_future: bool = True #či sa použáva decoder
+    use_known_future: bool = False #či sa použáva decoder
+    # use_known_future: bool = True #či sa použáva decoder
 
     # Optional quantile crossing penalty (0 = off)
     crossing_penalty_weight: float = 0.0    #pridá penalizáciu crossingov
@@ -143,6 +148,10 @@ class QuantileEncoderDecoderTransformer(nn.Module):
 
         # store quantiles as buffer so it moves with .to(device)
         self.register_buffer("quantiles", torch.tensor(list(cfg.quantiles), dtype=torch.float32))
+        # quantile weights (emphasize tails)
+        weights = torch.tensor([2.0, 1.5, 1.2, 1.0, 1.0, 1.0, 1.2, 1.5, 2.0], dtype=torch.float32)
+        weights = weights / weights.mean()  # normalize
+        self.register_buffer("quantile_weights", weights)
 
         # Projections
         self.enc_in_proj = nn.Linear(cfg.d_enc_in, cfg.d_model)
@@ -227,7 +236,13 @@ class QuantileEncoderDecoderTransformer(nn.Module):
         return yhat_q
 
     def loss(self, y_true: torch.Tensor, yhat_q: torch.Tensor) -> torch.Tensor:
-        base = pinball_loss(y_true, yhat_q, self.quantiles, reduction="mean")
+        base = pinball_loss(
+            y_true,
+            yhat_q,
+            self.quantiles,
+            weights=self.quantile_weights,
+            reduction="mean",
+        )
         if self.cfg.crossing_penalty_weight > 0:
             base = base + self.cfg.crossing_penalty_weight * quantile_crossing_penalty(yhat_q)
         return base
@@ -246,7 +261,8 @@ def build_cfg_from_prepared(
     num_decoder_layers: int = 4,
     dim_feedforward: int = 512,
     dropout: float = 0.1,
-    use_known_future: bool = True,
+    # use_known_future: bool = True,
+    use_known_future: bool = False,
     crossing_penalty_weight: float = 0.0,
 ) -> QuantileTransformerConfig:
     d_enc_in = len(prepared.feature_cols["enc"])
