@@ -1,133 +1,183 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from model import PositionalEncoding
 
-
-class TokenEmbedding(nn.Module):
+# -----------------------------
+# Temporal LayerNorm (RevIN-like)
+# -----------------------------
+class TemporalNorm(nn.Module):
     """
-    Value embedding using Conv1d over time (B,T,C) -> (B,T,D).
+    "Temporal LayerNorm" v iTransformer je v praxi normalizácia
+    po časovej osi pre každý variate token zvlášť.
+    (v paperi to slúži na zníženie rozdielov medzi variatmi). :contentReference[oaicite:2]{index=2}
+
+    Keď už škáluješ vstupy aj target globálne (tvoj StandardScalerNP),
+    odporúčam nechať use_temporal_norm=False (default).
     """
-    def __init__(self, c_in: int, d_model: int):
+    def __init__(self, eps: float = 1e-5, affine: bool = False):
         super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels=c_in,
-            out_channels=d_model,
-            kernel_size=3,
-            padding=1,
-            padding_mode="circular",
-            bias=True,
-        )
-        nn.init.kaiming_normal_(self.conv.weight, mode="fan_in", nonlinearity="leaky_relu")
+        self.eps = eps
+        self.affine = affine
+        self.gamma = None
+        self.beta = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x.transpose(1, 2)).transpose(1, 2)
+        # affine po (N variates) nevieme dopredu, takže affine=False default
 
-# -----------------------------
-# Config
-# -----------------------------
-@dataclass
-class LTSFQuantileEncoderConfig:
-    # lengths
-    lookback: int = 96   # L
-    horizon: int = 96    # H
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        x: [B, L, N]
+        returns:
+          x_norm: [B, L, N]
+          mu:     [B, 1, N]
+          sigma:  [B, 1, N]
+        """
+        mu = x.mean(dim=1, keepdim=True)
+        var = (x - mu).pow(2).mean(dim=1, keepdim=True)
+        sigma = torch.sqrt(var + self.eps)
+        x_norm = (x - mu) / sigma
+        return x_norm, mu, sigma
 
-    # data dims
-    c_in: int = 1        # number of input features per timestep
-    quantiles: Sequence[float] = tuple([0.1 * i for i in range(1, 10)])  # Q=9
-    crossing_penalty_weight: float = 0.0
-
-    # transformer
-    d_model: int = 512
-    nhead: int = 8
-    num_layers: int = 4
-    dim_feedforward: int = 2048
-    dropout: float = 0.1
-
-    # positional
-    max_len: int = 10000
-
-    # readout strategy: "last" or "mean"
-    readout: str = "last"
+    @staticmethod
+    def denorm(y: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        """
+        y:    [B, H, N]
+        mu,sigma: [B, 1, N]  -> broadcast na H
+        """
+        return y * sigma + mu
 
 
 # -----------------------------
-# LTSF Transformer (encoder-only) -> quantiles
+# iTransformer Encoder Block (PreNorm)
 # -----------------------------
-class LTSFQuantileTransformerEncoderOnly(nn.Module):
-    """
-    Encoder-only Transformer (tokens = time steps) in LTSF style,
-    producing quantile forecasts (B,H,Q).
-    """
-    def __init__(self, cfg: LTSFQuantileEncoderConfig):
+class ITransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
         super().__init__()
-        self.cfg = cfg
-        self.L = int(cfg.lookback)
-        self.H = int(cfg.horizon)
-        self.Q = len(cfg.quantiles)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.drop1 = nn.Dropout(dropout)
 
-        self.register_buffer(
-            "quantiles",
-            torch.tensor(list(cfg.quantiles), dtype=torch.float32),
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
         )
 
-        # LTSF-style value embedding + positional encoding
-        self.value_embedding = TokenEmbedding(cfg.c_in, cfg.d_model)
-        self.pos_enc = PositionalEncoding(cfg.d_model, max_len=cfg.max_len)
-        self.dropout = nn.Dropout(cfg.dropout)
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: [B, N, D]  (N = počet variates = tokeny v inverted view) :contentReference[oaicite:3]{index=3}
+        x = self.ln1(h)
+        attn_out, _ = self.attn(x, x, x, need_weights=False)
+        h = h + self.drop1(attn_out)
 
-        # Encoder
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.nhead,
-            dim_feedforward=cfg.dim_feedforward,
-            dropout=cfg.dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=cfg.num_layers)
+        x = self.ln2(h)
+        h = h + self.ffn(x)
+        return h
 
-        # Head: (B,D) -> (B,H*Q) -> (B,H,Q)
-        self.out_head = nn.Linear(cfg.d_model, self.H * self.Q)
 
-    def forward(
+# -----------------------------
+# iTransformer
+# -----------------------------
+class ITransformer(nn.Module):
+    """
+    iTransformer (encoder-only):
+      - tokeny = variates (features/series), nie časové kroky :contentReference[oaicite:4]{index=4}
+      - Embedding: MLP z R^T -> R^D :contentReference[oaicite:5]{index=5}
+      - Projection: MLP z R^D -> R^S (pred_len) :contentReference[oaicite:6]{index=6}
+      - Bez positional embedding (paper tvrdí, že nie je potrebný v inverted setting) :contentReference[oaicite:7]{index=7}
+
+    Input:
+      x_hist: [B, L, N]
+    Output:
+      y_hat:  [B, H, N]  (ak return_all=True)
+      alebo  [B, H]      (ak return_all=False a target_index je nastavený)
+    """
+    def __init__(
         self,
-        x_hist: torch.Tensor,                        # (B,L,C_in)
-        hist_padding_mask: Optional[torch.Tensor] = None,  # (B,L) True=padded (optional)
-    ) -> torch.Tensor:
-        B, L, C = x_hist.shape
-        if L != self.L:
-            raise ValueError(f"Expected lookback L={self.L}, got L={L}")
-        if C != self.cfg.c_in:
-            raise ValueError(f"x_hist channels {C} != cfg.c_in {self.cfg.c_in}")
+        lookback_len: int,   # L
+        pred_len: int,       # H
+        n_vars: int,         # N = počet vstupných kanálov (enc features)
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_layers: int = 4,
+        d_ff: int = 512,
+        dropout: float = 0.1,
+        use_temporal_norm: bool = False,
+        return_all: bool = False,
+        target_index: Optional[int] = None,
+    ):
+        super().__init__()
+        if (not return_all) and (target_index is None):
+            raise ValueError("Ak return_all=False, musíš nastaviť target_index (index target variate v x_hist).")
 
-        # embed + positional
-        z = self.value_embedding(x_hist)   # (B,L,D)
-        z = self.pos_enc(z)                # (B,L,D)
-        z = self.dropout(z)
+        self.lookback_len = lookback_len
+        self.pred_len = pred_len
+        self.n_vars = n_vars
+        self.use_temporal_norm = use_temporal_norm
+        self.return_all = return_all
+        self.target_index = target_index
 
-        # encode over time
-        memory = self.encoder(z, src_key_padding_mask=hist_padding_mask)  # (B,L,D)
+        self.temp_norm = TemporalNorm() if use_temporal_norm else None
 
-        # readout
-        if self.cfg.readout == "last":
-            rep = memory[:, -1, :]         # (B,D)
-        elif self.cfg.readout == "mean":
-            rep = memory.mean(dim=1)       # (B,D)
-        else:
-            raise ValueError("cfg.readout must be 'last' or 'mean'")
+        # Embedding: pre každý variate token berieme jeho časový priebeh dĺžky L a mapujeme do D :contentReference[oaicite:8]{index=8}
+        self.variate_embedding = nn.Sequential(
+            nn.Linear(lookback_len, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+        )
 
-        # forecast quantiles
-        y = self.out_head(rep)                 # (B,H*Q)
-        yhat_q = y.view(B, self.H, self.Q)     # (B,H,Q)
-        return yhat_q
+        self.blocks = nn.ModuleList([
+            ITransformerBlock(d_model=d_model, n_heads=n_heads, d_ff=d_ff, dropout=dropout)
+            for _ in range(n_layers)
+        ])
 
-    def loss(self, y_true: torch.Tensor, yhat_q: torch.Tensor) -> torch.Tensor:
-        base = pinball_loss(y_true, yhat_q, self.quantiles, reduction="mean")
-        if getattr(self.cfg, "crossing_penalty_weight", 0.0) > 0:
-            base = base + self.cfg.crossing_penalty_weight * quantile_crossing_penalty(yhat_q)
-        return base
+        # Projection: per token (per variate) -> H bodov dopredu :contentReference[oaicite:9]{index=9}
+        self.projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, pred_len),
+        )
+
+    def forward(self, x_hist: torch.Tensor) -> torch.Tensor:
+        """
+        x_hist: [B, L, N]
+        """
+        if x_hist.dim() != 3:
+            raise ValueError(f"x_hist musí mať tvar [B,L,N], dostal som {tuple(x_hist.shape)}")
+
+        mu = sigma = None
+        if self.use_temporal_norm:
+            x_hist, mu, sigma = self.temp_norm(x_hist)  # [B,L,N], [B,1,N], [B,1,N]
+
+        # invert: [B,L,N] -> [B,N,L]
+        x_inv = x_hist.permute(0, 2, 1).contiguous()
+
+        # embed per variate: [B,N,L] -> [B,N,D]
+        h = self.variate_embedding(x_inv)
+
+        # Transformer encoder over variate tokens
+        for blk in self.blocks:
+            h = blk(h)
+
+        # project per token: [B,N,D] -> [B,N,H] -> [B,H,N]
+        y = self.projection(h).permute(0, 2, 1).contiguous()
+
+        # denorm (ak používaš temporal norm)
+        if self.use_temporal_norm:
+            y = TemporalNorm.denorm(y, mu=mu, sigma=sigma)
+
+        if self.return_all:
+            return y  # [B,H,N]
+
+        # iba target kanál
+        return y[:, :, self.target_index]  # [B,H]

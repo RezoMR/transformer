@@ -100,6 +100,27 @@ def _inverse_scale_y(y_scaled: np.ndarray, y_scaler: Optional[StandardScalerNP])
     inv = y_scaler.inverse_transform(flat).reshape(shp)
     return inv
 
+
+#-------------ROBUST SCALING----------
+@dataclass
+class RobustScalerNP:
+    median_: Optional[np.ndarray] = None
+    iqr_: Optional[np.ndarray] = None
+    eps: float = 1e-8
+
+    def fit(self, x: np.ndarray) -> "RobustScalerNP":
+        self.median_ = np.median(x, axis=0, keepdims=True)
+        q75 = np.percentile(x, 75, axis=0, keepdims=True)
+        q25 = np.percentile(x, 25, axis=0, keepdims=True)
+        self.iqr_ = q75 - q25
+        self.iqr_ = np.where(self.iqr_ < self.eps, 1.0, self.iqr_)
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.median_) / self.iqr_
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        return x * self.iqr_ + self.median_
 # -----------------------------
 # Windowing helpers
 # -----------------------------
@@ -182,7 +203,8 @@ class PreparedData:
     train_loader: DataLoader
     val_loader: DataLoader
     test_loader: DataLoader
-    scalers: Dict[str, StandardScalerNP]
+    scalers: Dict[str, RobustScalerNP]
+    # scalers: Dict[str, StandardScalerNP]
     feature_cols: Dict[str, List[str]]
     arrays: Dict[str, Dict[str, np.ndarray]]
 
@@ -270,21 +292,25 @@ def prepare_for_quantile_transformer(
     n_samples = X_hist.shape[0]
     train_idx, val_idx, test_idx = time_split_indices(n_samples, train_frac=train_frac, val_frac=val_frac)
 
-    scalers: Dict[str, StandardScalerNP] = {}
+    # scalers: Dict[str, StandardScalerNP] = {}
+    scalers: Dict[str, RobustScalerNP] = {}
 
     # 8) scaling fit only on train
     if scale_features:
-        enc_scaler = StandardScalerNP().fit(X_hist[train_idx].reshape(-1, X_hist.shape[-1]))
+        # enc_scaler = StandardScalerNP().fit(X_hist[train_idx].reshape(-1, X_hist.shape[-1]))
+        enc_scaler = RobustScalerNP().fit(X_hist[train_idx].reshape(-1, X_hist.shape[-1]))
         X_hist = enc_scaler.transform(X_hist.reshape(-1, X_hist.shape[-1])).reshape(X_hist.shape)
         scalers["enc"] = enc_scaler
 
         if X_fut is not None:
-            dec_scaler = StandardScalerNP().fit(X_fut[train_idx].reshape(-1, X_fut.shape[-1]))
+            dec_scaler = RobustScalerNP().fit(X_fut[train_idx].reshape(-1, X_fut.shape[-1]))
+            # dec_scaler = StandardScalerNP().fit(X_fut[train_idx].reshape(-1, X_fut.shape[-1]))
             X_fut = dec_scaler.transform(X_fut.reshape(-1, X_fut.shape[-1])).reshape(X_fut.shape)
             scalers["dec"] = dec_scaler
 
     if scale_target:
-        y_scaler = StandardScalerNP().fit(Y_fut[train_idx].reshape(-1, 1))
+        # y_scaler = StandardScalerNP().fit(Y_fut[train_idx].reshape(-1, 1))
+        y_scaler = RobustScalerNP().fit(Y_fut[train_idx].reshape(-1, 1))
         Y_fut = y_scaler.transform(Y_fut.reshape(-1, 1)).reshape(Y_fut.shape)
         scalers["y"] = y_scaler
 
